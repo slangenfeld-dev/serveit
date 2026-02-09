@@ -9,3 +9,4 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 clap = { version = "4", features = ["derive"] }
 mime_guess = "2"
 urlencoding = "2"
+base64 = "0.22"
