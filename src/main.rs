@@ -1,5 +1,5 @@
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -13,8 +13,13 @@ use axum::{
 };
 use clap::Parser;
 
+use axum_server::tls_rustls::RustlsConfig;
+
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
+
 #[derive(Parser, Debug)]
-#[command(name = "serveit", about = "Serve a directory over HTTP (with directory listings)")]
+#[command(name = "serveit", about = "Serve a directory over HTTP/HTTPS (with directory listings)")]
 struct Args {
     /// Interface/IP to bind to (e.g. 127.0.0.1 or 0.0.0.0)
     #[arg(short = 'i', long = "interface", default_value = "127.0.0.1")]
@@ -32,6 +37,16 @@ struct Args {
     /// Example: --auth admin:secret
     #[arg(long = "auth")]
     auth: Option<String>,
+
+    /// Serve HTTPS only (self-signed certificate generated at startup)
+    #[arg(long = "https")]
+    https: bool,
+
+    /// Print the generated certificate PEM to stdout (useful for importing into trust store).
+    /// If used with --https, it prints the cert always.
+    /// It will also print the private key PEM to stderr.
+    #[arg(long = "print-cert")]
+    print_cert: bool,
 }
 
 #[derive(Clone)]
@@ -61,6 +76,13 @@ impl AuthConfig {
 
 #[tokio::main]
 async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let root = args
@@ -76,26 +98,91 @@ async fn main() {
 
     let addr: SocketAddr = format!("{}:{}", args.interface, args.port)
         .parse()
-        .expect("invalid interface/port");
+        .map_err(|_| "invalid interface/port")?;
 
     println!("Serving: {}", root.display());
-    println!("Listening on: http://{addr}");
-    if auth.is_some() {
-        println!("Auth: enabled (HTTP Basic)");
-    } else {
-        println!("Auth: disabled");
-    }
+    println!(
+        "Auth: {}",
+        if auth.is_some() { "enabled" } else { "disabled" }
+    );
 
     let app = Router::new()
         .route("/", get(serve_root))
         .route("/*path", get(serve_path))
         .with_state(AppState { root, auth });
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
+    if args.https {
+        // Install the rustls CryptoProvider (ring backend) to avoid panic
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
 
-    axum::serve(listener, app).await.expect("server error");
+        let (tls, cert_pem, key_pem) =
+            generate_self_signed_tls_with_pem(&args.interface).await?;
+
+        if args.print_cert {
+            // Cert to stdout (safe-ish), key to stderr (keep out of logs if you redirect stdout)
+            print!("{cert_pem}");
+            eprintln!("{key_pem}");
+        }
+
+        println!("Listening on: https://{addr}");
+        println!("Tip: open https://localhost:{} (or https://127.0.0.1:{})", args.port, args.port);
+
+        axum_server::bind_rustls(addr, tls)
+            .serve(app.into_make_service())
+            .await?;
+
+        Ok(())
+    } else {
+        if args.print_cert {
+            eprintln!("--print-cert only makes sense with --https (no cert is generated for HTTP).");
+        }
+
+        println!("Listening on: http://{addr}");
+
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
+
+        axum::serve(listener, app).await?;
+        Ok(())
+    }
+}
+
+async fn generate_self_signed_tls_with_pem(
+    interface: &str,
+) -> Result<(RustlsConfig, String, String), Box<dyn std::error::Error>> {
+    use rcgen::{CertificateParams, DistinguishedName, DnType, SanType};
+
+    let mut params = CertificateParams::new(vec!["localhost".to_string()])?;
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "serveit");
+    params.distinguished_name = dn;
+
+    // Allow https://127.0.0.1
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress(IpAddr::from([127, 0, 0, 1])));
+
+    // If binding to a concrete IP (e.g. 192.168.1.10), include it in SAN.
+    // If it's 0.0.0.0 / :: (bind-any), skip it (you don't browse to 0.0.0.0).
+    if let Ok(ip) = interface.parse::<IpAddr>() {
+        if !ip.is_unspecified() {
+            params.subject_alt_names.push(SanType::IpAddress(ip));
+        }
+    }
+
+    // rcgen 0.13 API: KeyPair + self_signed
+    let key_pair = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
+
+    let tls = RustlsConfig::from_pem(cert_pem.clone().into_bytes(), key_pem.clone().into_bytes()).await?;
+    Ok((tls, cert_pem, key_pem))
 }
 
 async fn serve_root(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -111,70 +198,62 @@ async fn serve_path(
 }
 
 async fn serve_rel_path(state: AppState, headers: HeaderMap, rel: &str) -> Response {
-    // Optional basic auth
     if let Some(cfg) = &state.auth {
         if !is_authorized(&headers, cfg) {
             return unauthorized();
         }
     }
 
-    // URL decode (so "My%20File.txt" works)
     let decoded = match urlencoding::decode(rel) {
         Ok(s) => s.into_owned(),
         Err(_) => return (StatusCode::BAD_REQUEST, "Bad URL encoding").into_response(),
     };
 
-    // Build a candidate path
     let candidate = state.root.join(&decoded);
 
-    // Path traversal protection: canonicalize and ensure it stays under root.
-    // Note: canonicalize requires the path to exist, so we do existence check after.
     let meta = match tokio::fs::metadata(&candidate).await {
         Ok(m) => m,
         Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
 
-    let canon_candidate = match tokio::fs::canonicalize(&candidate).await {
+    let canon = match tokio::fs::canonicalize(&candidate).await {
         Ok(p) => p,
         Err(_) => return (StatusCode::FORBIDDEN, "Forbidden").into_response(),
     };
 
-    if !canon_candidate.starts_with(&state.root) {
+    if !canon.starts_with(&state.root) {
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
 
     if meta.is_dir() {
-        // If directory has an index file, serve it
-        if let Some(index_path) = find_index_file(&canon_candidate).await {
-            return serve_file(&index_path).await;
+        if let Some(index) = find_index_file(&canon).await {
+            return serve_file(&index).await;
         }
-        // Otherwise list directory
-        return list_dir(&state.root, &canon_candidate).await;
+        return list_dir(&state.root, &canon).await;
     }
 
-    // Serve file
-    serve_file(&canon_candidate).await
+    serve_file(&canon).await
 }
 
 fn is_authorized(headers: &HeaderMap, cfg: &AuthConfig) -> bool {
     let Some(value) = headers.get(header::AUTHORIZATION) else {
         return false;
     };
-    let Ok(s) = value.to_str() else { return false; };
-
-    // Expect: "Basic base64(user:pass)"
+    let Ok(s) = value.to_str() else {
+        return false;
+    };
     let Some(b64) = s.strip_prefix("Basic ") else {
         return false;
     };
 
-    let Ok(decoded_bytes) = base64::decode(b64) else {
+    let Ok(decoded) = B64.decode(b64) else {
         return false;
     };
-    let Ok(decoded_str) = String::from_utf8(decoded_bytes) else {
+    let Ok(decoded) = String::from_utf8(decoded) else {
         return false;
     };
 
-    decoded_str == format!("{}:{}", cfg.user, cfg.pass)
+    decoded == format!("{}:{}", cfg.user, cfg.pass)
 }
 
 fn unauthorized() -> Response {
@@ -186,11 +265,9 @@ fn unauthorized() -> Response {
 }
 
 async fn find_index_file(dir: &Path) -> Option<PathBuf> {
-    // Try a few common names (add more if you like)
-    let candidates = ["index.html", "index.htm"];
-    for name in candidates {
+    for name in ["index.html", "index.htm"] {
         let p = dir.join(name);
-        if tokio::fs::metadata(&p).await.ok().map(|m| m.is_file()).unwrap_or(false) {
+        if tokio::fs::metadata(&p).await.ok()?.is_file() {
             return Some(p);
         }
     }
@@ -212,13 +289,13 @@ async fn serve_file(path: &Path) -> Response {
 }
 
 async fn list_dir(root: &Path, dir: &Path) -> Response {
-    let mut entries = match tokio::fs::read_dir(dir).await {
-        Ok(rd) => rd,
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(r) => r,
         Err(_) => return (StatusCode::FORBIDDEN, "Cannot read directory").into_response(),
     };
 
-    let mut items: Vec<(String, bool)> = Vec::new();
-    while let Ok(Some(e)) = entries.next_entry().await {
+    let mut items = Vec::new();
+    while let Ok(Some(e)) = rd.next_entry().await {
         let name = e.file_name().to_string_lossy().to_string();
         let is_dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
         items.push((name, is_dir));
@@ -227,12 +304,10 @@ async fn list_dir(root: &Path, dir: &Path) -> Response {
 
     let mut html = String::new();
     html.push_str("<!doctype html><html><head><meta charset='utf-8'>");
-    html.push_str("<title>Index</title>");
-    html.push_str("<style>body{font-family:system-ui,Arial,sans-serif} a{text-decoration:none}</style>");
-    html.push_str("</head><body>");
+    html.push_str("<title>Index</title></head><body>");
     html.push_str(&format!(
         "<h1>Index of {}</h1><ul>",
-        html_escape(&display_rel(root, dir))
+        display_rel(root, dir)
     ));
 
     if dir != root {
@@ -246,11 +321,9 @@ async fn list_dir(root: &Path, dir: &Path) -> Response {
         } else {
             urlencoding::encode(&name).to_string()
         };
-
         html.push_str(&format!(
-            "<li><a href=\"{href}\">{text}</a></li>",
-            href = href,
-            text = html_escape(&display)
+            "<li><a href=\"{href}\">{}</a></li>",
+            html_escape(&display)
         ));
     }
 
